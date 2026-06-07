@@ -1,0 +1,7 @@
+# Binaries
+kiro-proxy
+kiro-proxy.exe
+kiro-proxy-linux
+
+# Build artifacts
+*.out
