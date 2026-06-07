@@ -23,6 +23,8 @@ type ProxyHandler struct {
 var modelSuffixRe = regexp.MustCompile(`\[\d+m\]$`)
 
 func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		p.writeError(w, 400, "failed to read request body")
@@ -32,6 +34,11 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	body = p.cleanRequestBody(body)
 	isStream := p.isStreamingRequest(body, r)
+
+	// Log incoming request
+	clientIP := r.RemoteAddr
+	model := p.extractModel(body)
+	p.Logger.Printf("[req] %s %s %s (stream=%v, model=%s)", clientIP, r.Method, r.URL.Path, isStream, model)
 
 	var lastErr error
 	for attempt := 0; attempt <= p.MaxRetries; attempt++ {
@@ -51,6 +58,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if lastErr == nil {
+			p.Logger.Printf("[done] 200 OK in %v", time.Since(start).Round(time.Millisecond))
 			return
 		}
 
@@ -63,6 +71,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if lastErr != nil {
+		p.Logger.Printf("[fail] 502 after %d attempts in %v: %v", p.MaxRetries+1, time.Since(start).Round(time.Millisecond), lastErr)
 		p.writeError(w, 502, fmt.Sprintf("upstream failed after %d attempts: %v", p.MaxRetries+1, lastErr))
 	}
 }
@@ -76,12 +85,15 @@ func (p *ProxyHandler) handleStreamingBuffered(w http.ResponseWriter, r *http.Re
 	}
 	defer resp.Body.Close()
 
+	p.Logger.Printf("[upstream] → %s%s (status=%d)", p.UpstreamURL, r.URL.Path, resp.StatusCode)
+
 	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(resp.Body)
 		shouldRetry, reason := ShouldRetry(resp.StatusCode, respBody)
 		if shouldRetry {
 			return fmt.Errorf("upstream %d: %s", resp.StatusCode, reason)
 		}
+		p.Logger.Printf("[forward] upstream error %d → client", resp.StatusCode)
 		p.forwardRaw(w, respBody, resp.Header, resp.StatusCode)
 		return nil
 	}
@@ -130,6 +142,8 @@ func (p *ProxyHandler) handleStreamingBuffered(w http.ResponseWriter, r *http.Re
 				dataLines = nil
 			}
 		}
+
+		p.Logger.Printf("[stream] buffered %d events, complete=%v", len(events), !state.IsIncomplete())
 
 		if state.IsIncomplete() {
 			return fmt.Errorf("stream truncated: %d open blocks, message_complete=%v", state.OpenBlocks, state.MessageComplete)
@@ -193,6 +207,8 @@ func (p *ProxyHandler) handleNonStreaming(w http.ResponseWriter, r *http.Request
 	}
 	defer resp.Body.Close()
 
+	p.Logger.Printf("[upstream] → %s%s (status=%d)", p.UpstreamURL, r.URL.Path, resp.StatusCode)
+
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
@@ -203,6 +219,7 @@ func (p *ProxyHandler) handleNonStreaming(w http.ResponseWriter, r *http.Request
 		if shouldRetry {
 			return fmt.Errorf("upstream %d: %s", resp.StatusCode, reason)
 		}
+		p.Logger.Printf("[forward] upstream error %d → client", resp.StatusCode)
 		p.forwardRaw(w, respBody, resp.Header, resp.StatusCode)
 		return nil
 	}
@@ -212,6 +229,8 @@ func (p *ProxyHandler) handleNonStreaming(w http.ResponseWriter, r *http.Request
 	if valid, reason := ValidateResponse(respBody); !valid {
 		return fmt.Errorf("invalid response: %s", reason)
 	}
+
+	p.Logger.Printf("[response] JSON %d bytes, valid=true → client", len(respBody))
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
@@ -567,6 +586,16 @@ func (p *ProxyHandler) injectWriteWorkaround(req map[string]interface{}) bool {
 	// No system field — add one
 	req["system"] = writeWorkaroundInstruction
 	return true
+}
+
+func (p *ProxyHandler) extractModel(body []byte) string {
+	var req map[string]interface{}
+	if err := json.Unmarshal(body, &req); err == nil {
+		if model, ok := req["model"].(string); ok {
+			return model
+		}
+	}
+	return "unknown"
 }
 
 func (p *ProxyHandler) isStreamingRequest(body []byte, r *http.Request) bool {
