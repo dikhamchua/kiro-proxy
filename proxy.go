@@ -25,6 +25,26 @@ var modelSuffixRe = regexp.MustCompile(`\[\d+m\]$`)
 func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
+	// HEAD requests: forward upstream and return status+headers only (no body to process)
+	if r.Method == http.MethodHead {
+		clientIP := r.RemoteAddr
+		p.Logger.Printf("[req] %s %s %s (stream=false, model=unknown)", clientIP, r.Method, r.URL.Path)
+		resp, err := p.doUpstreamRequest(r, nil)
+		if err != nil {
+			p.writeError(w, 502, fmt.Sprintf("upstream connect: %v", err))
+			return
+		}
+		resp.Body.Close()
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		p.Logger.Printf("[done] HEAD %d in %v", resp.StatusCode, time.Since(start).Round(time.Millisecond))
+		return
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		p.writeError(w, 400, "failed to read request body")
