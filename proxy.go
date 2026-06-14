@@ -22,8 +22,21 @@ type ProxyHandler struct {
 
 var modelSuffixRe = regexp.MustCompile(`\[\d+m\]$`)
 
+func isAnthropicPath(path string) bool {
+	return strings.HasPrefix(path, "/v1/messages") || strings.HasPrefix(path, "/v1/complete")
+}
+
 func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+
+	// Non-Anthropic paths: pass-through reverse proxy (no validation, no normalize)
+	if !isAnthropicPath(r.URL.Path) && r.Method != http.MethodHead {
+		clientIP := r.RemoteAddr
+		p.Logger.Printf("[req] %s %s %s (passthrough)", clientIP, r.Method, r.URL.Path)
+		p.handlePassthrough(w, r)
+		p.Logger.Printf("[done] passthrough in %v", time.Since(start).Round(time.Millisecond))
+		return
+	}
 
 	// HEAD requests: forward upstream and return status+headers only (no body to process)
 	if r.Method == http.MethodHead {
@@ -638,6 +651,41 @@ func (p *ProxyHandler) writeError(w http.ResponseWriter, status int, msg string)
 		"type": "error",
 		"error": map[string]interface{}{"type": "proxy_error", "message": msg},
 	})
+}
+
+// handlePassthrough is a raw reverse proxy for non-Anthropic paths.
+// No body buffering, no validation, no normalize — just forward.
+func (p *ProxyHandler) handlePassthrough(w http.ResponseWriter, r *http.Request) {
+	upstreamURL := p.UpstreamURL + r.URL.Path
+	if r.URL.RawQuery != "" {
+		upstreamURL += "?" + r.URL.RawQuery
+	}
+
+	req, err := http.NewRequest(r.Method, upstreamURL, r.Body)
+	if err != nil {
+		p.writeError(w, 502, fmt.Sprintf("passthrough build req: %v", err))
+		return
+	}
+	for k, v := range r.Header {
+		for _, vv := range v {
+			req.Header.Add(k, vv)
+		}
+	}
+
+	resp, err := p.Client.Do(req)
+	if err != nil {
+		p.writeError(w, 502, fmt.Sprintf("passthrough upstream: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, v := range resp.Header {
+		for _, vv := range v {
+			w.Header().Add(k, vv)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 func chunkString(s string, maxLen int) []string {
