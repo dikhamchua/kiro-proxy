@@ -19,7 +19,7 @@ func getEnv(key, fallback string) string {
 
 func main() {
 	upstreamURL := getEnv("UPSTREAM_URL", "http://localhost:20128")
-	listenAddr := getEnv("LISTEN_HOST", "127.0.0.1") + ":" + getEnv("LISTEN_PORT", "8081")
+	listenAddr := getEnv("LISTEN_HOST", "") + ":" + getEnv("LISTEN_PORT", "8081")
 	maxRetries := 2
 	if v := os.Getenv("MAX_RETRIES"); v == "0" {
 		maxRetries = 0
