@@ -6,6 +6,8 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -17,10 +19,52 @@ type RetryConfig struct {
 	MaxDelay   time.Duration
 }
 
+// resetAfterPattern matches kiro upstream's "(reset after 26s)" or "(reset after 2m)" suffix.
+var resetAfterPattern = regexp.MustCompile(`reset after (\d+)([sm])`)
+
+// ParseResetAfter extracts the reset duration from a kiro error body.
+// Returns 0 if no reset hint is present.
+func ParseResetAfter(body []byte) time.Duration {
+	return parseResetAfterString(string(body))
+}
+
+func parseResetAfterString(s string) time.Duration {
+	m := resetAfterPattern.FindStringSubmatch(s)
+	if len(m) != 3 {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n <= 0 {
+		return 0
+	}
+	switch m[2] {
+	case "s":
+		return time.Duration(n) * time.Second
+	case "m":
+		return time.Duration(n) * time.Minute
+	}
+	return 0
+}
+
+// parseResetFromError extracts a reset hint embedded in an error message.
+func parseResetFromError(err error) time.Duration {
+	if err == nil {
+		return 0
+	}
+	return parseResetAfterString(err.Error())
+}
+
 func ShouldRetry(statusCode int, body []byte) (bool, string) {
+	bodyStr := string(body)
+
+	// Kiro upstream sometimes returns 400/403 with "(reset after Xs)" — that's
+	// a transient per-model quota, not a real client error. Treat as retryable.
+	if reset := ParseResetAfter(body); reset > 0 {
+		return true, "upstream model rate-limited (reset after " + reset.String() + ")"
+	}
+
 	switch statusCode {
 	case 400:
-		bodyStr := string(body)
 		if strings.Contains(bodyStr, "Improperly formed request") {
 			return true, "improperly formed request - will retry with cleaned model"
 		}
@@ -75,6 +119,8 @@ func IsRetryableError(err error) bool {
 		"service unavailable",
 		"gateway timeout",
 		"rate limited",
+		"rate-limited",
+		"reset after",
 		"connection reset",
 		"broken pipe",
 		"empty response",

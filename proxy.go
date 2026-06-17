@@ -76,11 +76,21 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var lastErr error
 	for attempt := 0; attempt <= p.MaxRetries; attempt++ {
 		if attempt > 0 {
-			delay := CalculateBackoff(attempt, RetryConfig{
-				BaseDelay: 1 * time.Second,
-				MaxDelay:  10 * time.Second,
-			})
-			p.Logger.Printf("[retry] attempt %d/%d after %v", attempt, p.MaxRetries, delay)
+			var delay time.Duration
+			// If upstream told us "reset after Xs", honor that exact wait.
+			if reset := parseResetFromError(lastErr); reset > 0 {
+				delay = reset + 500*time.Millisecond // small cushion
+				if delay > 120*time.Second {
+					delay = 120 * time.Second
+				}
+				p.Logger.Printf("[retry] attempt %d/%d after %v (upstream reset hint)", attempt, p.MaxRetries, delay)
+			} else {
+				delay = CalculateBackoff(attempt, RetryConfig{
+					BaseDelay: 1 * time.Second,
+					MaxDelay:  10 * time.Second,
+				})
+				p.Logger.Printf("[retry] attempt %d/%d after %v", attempt, p.MaxRetries, delay)
+			}
 			time.Sleep(delay)
 		}
 
