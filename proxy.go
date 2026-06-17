@@ -23,7 +23,23 @@ type ProxyHandler struct {
 var modelSuffixRe = regexp.MustCompile(`\[\d+m\]$`)
 
 func isAnthropicPath(path string) bool {
-	return strings.HasPrefix(path, "/v1/messages") || strings.HasPrefix(path, "/v1/complete")
+	return strings.HasPrefix(path, "/v1/messages") ||
+		strings.HasPrefix(path, "/v1/complete") ||
+		// Some clients (Kiro IDE, Claude Code) are configured with a base URL
+		// that already includes /v1, then their SDK appends /v1/messages again,
+		// producing /v1/v1/messages. Recognize those too so we apply the
+		// validate / retry / normalize pipeline.
+		strings.HasPrefix(path, "/v1/v1/messages") ||
+		strings.HasPrefix(path, "/v1/v1/complete")
+}
+
+// canonicalAnthropicPath collapses /v1/v1/... into /v1/... so upstream
+// requests and logs use a single canonical form.
+func canonicalAnthropicPath(path string) string {
+	if strings.HasPrefix(path, "/v1/v1/") {
+		return "/v1" + strings.TrimPrefix(path, "/v1/v1")
+	}
+	return path
 }
 
 func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -496,7 +512,7 @@ func (p *ProxyHandler) normalizeToAnthropic(body []byte) []byte {
 }
 
 func (p *ProxyHandler) doUpstreamRequest(r *http.Request, body []byte) (*http.Response, error) {
-	upstreamURL := p.UpstreamURL + r.URL.Path
+	upstreamURL := p.UpstreamURL + canonicalAnthropicPath(r.URL.Path)
 	if r.URL.RawQuery != "" {
 		upstreamURL += "?" + r.URL.RawQuery
 	}
